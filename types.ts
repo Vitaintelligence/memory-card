@@ -16,11 +16,12 @@ export enum GameMode {
 
 export interface Player {
   id: number;
+  clientId?: string; // Unique Network ID
   name: string;
   score: number;
   color: string;
   isAi?: boolean;
-  isLocal?: boolean; // For Online PvP to identify 'me'
+  isLocal?: boolean; // Computed based on clientId
 }
 
 export enum GameStatus {
@@ -40,6 +41,7 @@ export interface GameState {
   winner: Player | null | 'DRAW';
   roomId?: string; // For online
   region?: string; // For online
+  maxPlayers?: number;
 }
 
 export interface ThemeResponse {
