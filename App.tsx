@@ -10,10 +10,8 @@ import { ArrowLeft, Trophy, Copy, Wifi, Loader2, Radio, Eye, AlertTriangle } fro
 
 const COLORS = ['bg-neo-primary', 'bg-neo-accent', 'bg-neo-secondary', 'bg-green-400', 'bg-blue-400', 'bg-red-400', 'bg-pink-400', 'bg-indigo-400', 'bg-orange-400', 'bg-teal-400'];
 
-const INITIAL_PLAYERS: Player[] = [
-  { id: 1, name: 'Player 1', score: 0, color: 'bg-neo-primary' },
-  { id: 2, name: 'Player 2', score: 0, color: 'bg-neo-accent' }
-];
+// Initialize empty to prevent "Lobby Full" false positives
+const INITIAL_PLAYERS: Player[] = [];
 
 export default function App() {
   const [gameState, setGameState] = useState<GameState>({
@@ -89,8 +87,7 @@ export default function App() {
       setPlayers([]); 
       setShowQuitConfirm(false);
       
-      // Finally switch view
-      setGameState({
+      const newGameState = {
           status: GameStatus.LOBBY,
           mode: GameMode.SOLO,
           deckTheme: '',
@@ -100,7 +97,19 @@ export default function App() {
           roomId: '',
           region: '',
           maxPlayers: 2
-      });
+      };
+      
+      setGameState(newGameState);
+      // Force update ref immediately
+      stateRef.current = { 
+          gameState: newGameState, 
+          cards: [], 
+          players: [], 
+          flippedIndices: [], 
+          isProcessing: false, 
+          onlineRole: null 
+      };
+
   }, []);
 
   // Network Message Handler
@@ -109,12 +118,23 @@ export default function App() {
     
     // HOST: Handle Join Request
     if (msg.type === 'JOIN_REQUEST') {
-        if (current.gameState.status === GameStatus.WAITING_FOR_PLAYER) {
+        // Check if we are in a state to accept players
+        if (current.gameState.status === GameStatus.WAITING_FOR_PLAYER || (current.onlineRole === 'HOST' && current.gameState.status === GameStatus.GENERATING)) {
             
-            if (current.players.length >= (current.gameState.maxPlayers || 2)) return;
+            // Check if player is ALREADY joined
+            const existingPlayer = current.players.find(p => p.clientId === msg.senderId);
+            
+            if (existingPlayer) {
+                // IMPORTANT: If they are already joined, RESEND the update. 
+                // They might be retrying because they missed the first ack.
+                multiplayer.send('LOBBY_UPDATE', { players: current.players });
+                return;
+            }
 
-            // Check duplicate joins by Client ID
-            if (current.players.some(p => p.clientId === msg.senderId)) return;
+            if (current.players.length >= (current.gameState.maxPlayers || 2)) {
+                console.log("Rejecting join: Lobby Full", current.players.length, current.gameState.maxPlayers);
+                return;
+            }
 
             const guestName = msg.payload.guestName || `Player ${current.players.length + 1}`;
             const newPlayerId = current.players.length + 1;
@@ -129,6 +149,9 @@ export default function App() {
 
             const updatedPlayers = [...current.players, newPlayer];
             setPlayers(updatedPlayers);
+            
+            // Manual Ref Update to prevent race conditions on rapid joins
+            stateRef.current.players = updatedPlayers;
 
             // Sync everyone
             multiplayer.send('LOBBY_UPDATE', { players: updatedPlayers });
@@ -155,7 +178,14 @@ export default function App() {
                  ...p,
                  isLocal: p.clientId === myClientId
              }));
+             
+             // Update players list
              setPlayers(mappedPlayers);
+             
+             // If we were waiting/connecting, this confirms we are IN.
+             if (current.gameState.status === GameStatus.WAITING_FOR_PLAYER) {
+                 setLoadingMessage("Connected! Waiting for host...");
+             }
         }
     }
     // GAME START
@@ -195,6 +225,8 @@ export default function App() {
             
             if (current.gameState.status === GameStatus.WAITING_FOR_PLAYER) {
                 setPlayers(updatedPlayers);
+                stateRef.current.players = updatedPlayers;
+                
                 multiplayer.send('LOBBY_UPDATE', { players: updatedPlayers });
                 multiplayer.startAdvertising(
                     current.gameState.roomId!, 
@@ -264,7 +296,7 @@ export default function App() {
     setCurrentUser(userName);
     const myClientId = multiplayer.getClientId();
 
-    setGameState({
+    const newGameState = {
       status: GameStatus.GENERATING,
       mode,
       deckTheme: themeName,
@@ -274,25 +306,38 @@ export default function App() {
       roomId: roomConfig?.roomId || '',
       region,
       maxPlayers: roomConfig?.maxPlayers || 2
-    });
+    };
+
+    setGameState(newGameState);
     setCards([]);
     setFlippedIndices([]);
     setAiMemory(new Map());
     setIsProcessing(false);
     
+    // Default players setup (overwritten below for online)
+    let initialPlayers: Player[] = [];
+
     if (mode === GameMode.ONLINE_PVP && roomConfig) {
         multiplayer.joinRoom(roomConfig.roomId);
         
         if (roomConfig.isSpectator) {
             setOnlineRole('SPECTATOR');
+            setPlayers([]); // Waiting for snapshot
             setLoadingMessage("Connecting to stream...");
+            
+            // Manual Ref Update
+            stateRef.current = { 
+                gameState: newGameState, cards: [], players: [], flippedIndices: [], isProcessing: false, onlineRole: 'SPECTATOR' 
+            };
+
             setTimeout(() => {
                 multiplayer.send('SPECTATE_REQUEST', {});
             }, 500);
             return;
         }
 
-        setOnlineRole(roomConfig.isHost ? 'HOST' : 'GUEST');
+        const role = roomConfig.isHost ? 'HOST' : 'GUEST';
+        setOnlineRole(role);
         
         if (roomConfig.isHost) {
              const hostPlayer: Player = { 
@@ -303,8 +348,18 @@ export default function App() {
                  color: COLORS[0], 
                  isLocal: true 
              };
-             setPlayers([hostPlayer]);
-             setGameState(prev => ({ ...prev, status: GameStatus.WAITING_FOR_PLAYER }));
+             initialPlayers = [hostPlayer];
+             setPlayers(initialPlayers);
+             
+             // Important: Set status to WAITING immediately for ref, even if state update lags
+             const waitingState = { ...newGameState, status: GameStatus.WAITING_FOR_PLAYER };
+             setGameState(waitingState);
+             
+             // Manual Ref Update: THIS IS CRITICAL FOR RACE CONDITIONS
+             stateRef.current = { 
+                 gameState: waitingState, cards: [], players: initialPlayers, flippedIndices: [], isProcessing: false, onlineRole: 'HOST' 
+             };
+
              // Advertise
              multiplayer.startAdvertising(roomConfig.roomId, themeName, userName, 'OPEN', 1, roomConfig.maxPlayers || 2);
         } else {
@@ -317,39 +372,63 @@ export default function App() {
                 color: COLORS[1], 
                 isLocal: true 
              };
-            setPlayers([guestPlayerPlaceholder]);
+            initialPlayers = [guestPlayerPlaceholder];
+            setPlayers(initialPlayers);
             setLoadingMessage("Connecting to Host...");
-            setGameState(prev => ({ ...prev, status: GameStatus.WAITING_FOR_PLAYER }));
+            
+            const waitingState = { ...newGameState, status: GameStatus.WAITING_FOR_PLAYER };
+            setGameState(waitingState);
+
+            // Manual Ref Update
+             stateRef.current = { 
+                 gameState: waitingState, cards: [], players: initialPlayers, flippedIndices: [], isProcessing: false, onlineRole: 'GUEST' 
+             };
 
             // Retry join logic
             let attempts = 0;
             const joinInterval = setInterval(() => {
-                if (attempts > 5 || stateRef.current.gameState.status === GameStatus.PLAYING || stateRef.current.gameState.status === GameStatus.LOBBY) {
+                const current = stateRef.current;
+                
+                // Stop trying if we are already playing, lobby is loaded (players > 1), or too many attempts
+                const amIConnected = current.players.some(p => p.clientId === myClientId && current.players.length > 1);
+                
+                if (attempts > 20 || current.gameState.status === GameStatus.PLAYING || amIConnected) {
                     clearInterval(joinInterval);
                     return;
                 }
+                
+                // Send join request
                 multiplayer.send('JOIN_REQUEST', { guestName: userName });
                 attempts++;
-            }, 500);
+            }, 800); // Slightly slower interval to avoid flooding, but reliable
         }
     } else {
         // Setup local players
-        let newPlayers: Player[] = [];
         if (mode === GameMode.SOLO) {
-          newPlayers = [{ id: 1, name: userName, score: 0, color: COLORS[0] }];
+          initialPlayers = [{ id: 1, name: userName, score: 0, color: COLORS[0] }];
         } else if (mode === GameMode.LOCAL_PVP) {
-          newPlayers = [
+          initialPlayers = [
             { id: 1, name: 'Player 1', score: 0, color: COLORS[0] },
             { id: 2, name: 'Player 2', score: 0, color: COLORS[1] }
           ];
         } else if (mode === GameMode.VS_AI) {
-          newPlayers = [
+          initialPlayers = [
             { id: 1, name: userName, score: 0, color: COLORS[0] },
             { id: 2, name: 'Gemini AI', score: 0, color: 'bg-neo-dark text-white', isAi: true }
           ];
         }
-        setPlayers(newPlayers);
+        setPlayers(initialPlayers);
         setGameState(prev => ({ ...prev, status: GameStatus.GENERATING }));
+        
+        // Manual Ref Update
+        stateRef.current = { 
+            gameState: { ...newGameState, status: GameStatus.GENERATING }, 
+            cards: [], 
+            players: initialPlayers, 
+            flippedIndices: [], 
+            isProcessing: false, 
+            onlineRole: null 
+        };
     }
   }, []);
 
@@ -458,6 +537,7 @@ export default function App() {
           const isMatch = card1.content === card2.content;
 
           setTimeout(() => {
+              // Check if game still active (user didn't quit during timeout)
               if (stateRef.current.gameState.status !== GameStatus.PLAYING) return;
 
               let nextPlayers = [...stateRef.current.players];
@@ -465,17 +545,22 @@ export default function App() {
               let switchTurn = true;
 
               if (isMatch) {
-                  nextCards[idx1].isMatched = true;
-                  nextCards[idx2].isMatched = true;
-                  nextPlayers[gameState.currentPlayerIndex].score += 1;
+                  // Re-verify indices for safety
+                  if (nextCards[idx1] && nextCards[idx2]) {
+                    nextCards[idx1].isMatched = true;
+                    nextCards[idx2].isMatched = true;
+                    if(nextPlayers[gameState.currentPlayerIndex]) {
+                        nextPlayers[gameState.currentPlayerIndex].score += 1;
+                    }
+                  }
                   switchTurn = false; 
                   
                   if (nextCards.every(c => c.isMatched)) {
                       handleGameOver(nextPlayers);
                   }
               } else {
-                  nextCards[idx1].isFlipped = false;
-                  nextCards[idx2].isFlipped = false;
+                  if (nextCards[idx1]) nextCards[idx1].isFlipped = false;
+                  if (nextCards[idx2]) nextCards[idx2].isFlipped = false;
               }
 
               setCards(nextCards);
@@ -499,7 +584,7 @@ export default function App() {
     });
   };
 
-  // AI Logic
+  // AI Logic Trigger
   useEffect(() => {
       if (gameState.status === GameStatus.PLAYING && 
           gameState.mode === GameMode.VS_AI && 
@@ -520,7 +605,7 @@ export default function App() {
 
     const validMemory: {index: number, content: string}[] = [];
     aiMemory.forEach((index, id) => {
-        if (!currentCards[index].isMatched) {
+        if (currentCards[index] && !currentCards[index].isMatched) {
             validMemory.push({ index, content: currentCards[index].content });
         }
     });
@@ -544,18 +629,21 @@ export default function App() {
         }
     }
 
-    // 2. Random First
+    // 2. Random First if no pair
     if (firstMoveIndex === -1) {
         firstMoveIndex = availableIndices[Math.floor(Math.random() * availableIndices.length)];
     }
 
     const performAiMoves = async () => {
         if (stateRef.current.gameState.status !== GameStatus.PLAYING) return;
+        
+        // --- MOVE 1 ---
         revealCardAi(firstMoveIndex);
         
         await new Promise(r => setTimeout(r, 1000));
         if (stateRef.current.gameState.status !== GameStatus.PLAYING) return;
 
+        // Deciding Move 2
         if (secondMoveIndex === -1) {
              const freshCards = stateRef.current.cards;
              const firstCard = freshCards[firstMoveIndex]; 
@@ -571,15 +659,21 @@ export default function App() {
              }
         }
         
+        // Failsafe: If logic failed to pick a second card, pick ANY valid random card
+        // This prevents the AI from getting stuck with 1 card flipped
         if (secondMoveIndex === -1 || secondMoveIndex === firstMoveIndex) {
             const freshCards = stateRef.current.cards;
             const valid = freshCards.map((c,i) => i).filter(i => !freshCards[i].isMatched && !freshCards[i].isFlipped && i !== firstMoveIndex);
             if (valid.length > 0) {
                 secondMoveIndex = valid[Math.floor(Math.random() * valid.length)];
+            } else {
+                 // No moves left? Should not happen if game not over.
+                 return; 
             }
         }
 
-        if (secondMoveIndex !== -1 && secondMoveIndex !== firstMoveIndex) {
+        // --- MOVE 2 ---
+        if (secondMoveIndex !== -1) {
             revealCardAi(secondMoveIndex);
         }
     };
